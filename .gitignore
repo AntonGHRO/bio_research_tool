@@ -1,0 +1,17 @@
+#  Rust (frontend)
+frontend/target/
+**/*.rs.bk
+frontend/Cargo.lock   # optional: often committed, but you can ignore if you prefer
+
+#  Python (backend)
+backend/.venv/
+backend/__pycache__/
+backend/*.py[cod]
+backend/.mypy_cache/
+backend/.pytest_cache/
+# keep poetry.lock and pyproject.toml, but ignore any .env
+backend/*.env
+
+# OS junk
+.DS_Store
+
