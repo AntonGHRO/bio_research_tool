@@ -1,6 +1,6 @@
 use crate::models::{AppState, Dataset, Note, Project, Tab};
 use eframe::egui;
-use eframe::egui::{Align2, Color32, Pos2, Rect, Sense, Vec2};
+use eframe::egui::{Align2, Color32, Pos2, Rect, Sense, Ui, Vec2};
 use eframe::emath::RectTransform;
 use egui::{Direction, Layout};
 use egui_extras::{Column, TableBuilder};
@@ -12,6 +12,9 @@ use polars::prelude::{ChunkCompare, DataType};
 use polars::prelude::{CsvReader, SerReader};
 use rfd::FileDialog;
 use std::ops::Not;
+use futures::executor::block_on;
+use serde_json::Value;
+use crate::requests::{request_bar_chart_blocking};
 
 pub fn get_project_mut<'a>(projects: &'a mut [Project], path: &[usize]) -> Option<&'a mut Project> {
     if path.is_empty() {
@@ -227,7 +230,7 @@ pub fn tab_bar(ui: &mut egui::Ui, state: &mut AppState) {
     });
 }
 
-pub fn preview_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) {
+pub fn preview_tab(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
     if let Some(proj) = get_project_mut(&mut state.projects, &state.selected_project_path) {
         ui.vertical(|ui| {
             ui.vertical(|ui| {
@@ -413,7 +416,7 @@ pub fn preview_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState)
                                         for series in cols.iter() {
                                             let val = series.get(row_idx);
                                             row.col(|ui| {
-                                                ui.label(format!("{:?}", val));
+                                                ui.label(format!("{:?}", val.unwrap().get_str().unwrap_or("—")));
                                             });
                                         }
                                     });
@@ -437,7 +440,7 @@ pub fn preview_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState)
     }
 }
 
-pub fn graph_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) {
+pub fn graph_tab(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
     ui.vertical(|ui| {
         ui.heading("Graph Viewer");
 
@@ -578,10 +581,11 @@ pub fn graph_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) {
     });
 }
 
-pub fn bar_chart_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) {
+pub fn bar_chart_tab(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
     if let Some(proj) = get_project_mut(&mut state.projects, &state.selected_project_path) {
         ui.vertical(|ui| {
-            ui.heading("Diseases per Gene (Mock Data)");
+            ui.heading("[selected field] ");
+            ui.heading("[selected field] entries ");
 
             if proj.datasets.is_empty() {
                 ui.label("No datasets loaded. Go to Preview → ＋ Add CSV to load one.");
@@ -592,7 +596,7 @@ pub fn bar_chart_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppStat
             let mut chosen_idx = current_idx;
             ui.horizontal(|ui| {
                 ui.label("Dataset: ");
-                egui::ComboBox::from_id_source("mock_bar_dataset_combo")
+                egui::ComboBox::from_id_source("bar_dataset_combo")
                     .selected_text(
                         proj.datasets
                             .get(chosen_idx)
@@ -606,42 +610,110 @@ pub fn bar_chart_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppStat
                     });
                 if chosen_idx != current_idx {
                     proj.selected_dataset = Some(chosen_idx);
+                    state.bar_genes.clear();
+                    state.bar_counts.clear();
                 }
             });
 
             ui.separator();
 
             if let Some(ds_idx) = proj.selected_dataset {
-                if let Some(_ds) = proj.datasets.get(ds_idx) {
-                    // TODO:    Replace these two Vecs with a call into your Python backend:
-                    //          let (genes, counts) = python_backend::compute_disease_counts(&ds.path);
-                    let genes = vec![
-                        "TP53".to_string(),
-                        "BRCA1".to_string(),
-                        "EGFR".to_string(),
-                        "MYC".to_string(),
-                        "KRAS".to_string(),
-                    ];
-                    let counts = vec![42.0, 27.0, 13.0, 8.0, 5.0];
+                if let Some(ds) = proj.datasets.get(ds_idx) {
+                    let mut df = match CsvReader::from_path(&ds.path)
+                        .and_then(|rdr| rdr
+                            .infer_schema(None)
+                            .has_header(true)
+                            .finish())
+                    {
+                        Ok(df) => df,
+                        Err(err) => {
+                            ui.colored_label(egui::Color32::RED, format!("CSV load error: {}", err));
+                            return;
+                        }
+                    };
 
-                    let bars: Vec<Bar> = counts
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &c)| Bar::new(i as f64, c))
-                        .collect();
+                    if state.bar_genes.is_empty() && !state.is_fetching {
+                        state.is_fetching = true;
+                        let key = state.bar_selected_field.clone();
+                        let value = state.bar_selected_value.clone();
+                        let mut df_for_request = df.clone();
 
-                    Plot::new("mock_diseases_per_gene")
-                        .x_axis_formatter(|grid_mark, _range| {
-                            let idx = grid_mark.value.round() as usize;
-                            if idx < genes.len() {
-                                genes[idx].clone()
-                            } else {
-                                String::new()
+                        let response_result: Result<String, reqwest::Error> = request_bar_chart_blocking(&mut df_for_request, key, value);
+
+                        state.is_fetching = false;
+
+                        match response_result {
+                            Ok(text) => {
+                                match serde_json::from_str::<Value>(&text) {
+                                    Ok(json) => {
+                                        if let (Some(genes_arr), Some(counts_arr)) = (
+                                            json.get("genes").and_then(|v| v.as_array()),
+                                            json.get("counts").and_then(|v| v.as_array()),
+                                        ) {
+                                            state.bar_genes = genes_arr
+                                                .iter()
+                                                .map(|v| v.as_str().unwrap_or("").to_string())
+                                                .collect();
+
+                                            state.bar_counts = counts_arr
+                                                .iter()
+                                                .map(|v| v.as_f64().unwrap_or(0.0))
+                                                .collect();
+                                        } else {
+                                            ui.colored_label(
+                                                egui::Color32::RED,
+                                                "Unexpected JSON format: missing 'genes' or 'counts'",
+                                            );
+                                            return;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        ui.colored_label(
+                                            egui::Color32::RED,
+                                            format!("JSON parse error: {}", err),
+                                        );
+                                        return;
+                                    }
+                                }
                             }
-                        })
-                        .show(ui, |plot_ui| {
-                            plot_ui.bar_chart(BarChart::new(bars));
-                        });
+                            Err(err) => {
+                                ui.colored_label(
+                                    egui::Color32::RED,
+                                    format!("Request error: {}", err),
+                                );
+                                return;
+                            }
+                        }
+                    }
+
+                    if !state.bar_genes.is_empty() && state.bar_genes.len() == state.bar_counts.len()
+                    {
+                        let genes = &state.bar_genes;
+                        let counts = &state.bar_counts;
+
+                        let bars: Vec<Bar> = counts
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &c)| Bar::new(i as f64, c))
+                            .collect();
+
+                        Plot::new("real_diseases_per_gene")
+                            .x_axis_formatter(|grid_mark, _range| {
+                                let idx = grid_mark.value.round() as usize;
+                                if idx < genes.len() {
+                                    genes[idx].clone()
+                                } else {
+                                    String::new()
+                                }
+                            })
+                            .show(ui, |plot_ui| {
+                                plot_ui.bar_chart(BarChart::new(bars));
+                            });
+                    } else if state.is_fetching {
+                        ui.label("Loading chart…");
+                    } else {
+                        ui.label("No chart data available. Select a dataset above.");
+                    }
                 } else {
                     ui.label("Invalid dataset index.");
                 }

@@ -78,8 +78,11 @@
 
 // src/main.rs
 
+extern crate core;
+
 mod models;
 mod ui;
+mod requests;
 
 use crate::ui::get_project_mut;
 use eframe::egui::Vec2;
@@ -107,6 +110,11 @@ impl Default for MyApp {
                 graph_zoom: 1.0,
                 node_positions: Vec::new(),
                 layout_done: false,
+                bar_genes: Vec::new(),
+                bar_counts: Vec::new(),
+                is_fetching: false,
+                bar_selected_field: String::new(),
+                bar_selected_value: String::new(),
             },
         }
     }

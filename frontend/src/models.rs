@@ -38,6 +38,11 @@ pub struct AppState {
     pub graph_zoom: f32,
     pub node_positions: Vec<Vec2>,
     pub layout_done: bool,
+    pub bar_genes: Vec<String>,
+    pub bar_counts: Vec<f64>,
+    pub is_fetching: bool,
+    pub bar_selected_field: String,
+    pub bar_selected_value: String,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
