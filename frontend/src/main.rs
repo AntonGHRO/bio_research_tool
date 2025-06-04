@@ -81,6 +81,8 @@
 mod models;
 mod ui;
 
+use crate::ui::get_project_mut;
+use eframe::egui::Vec2;
 use eframe::{Error, egui};
 use egui::Visuals;
 use models::{AppState, Tab};
@@ -97,6 +99,14 @@ impl Default for MyApp {
                 selected_project_path: vec![],
                 selected_tab: Tab::Preview,
                 pending_delete: None,
+                note_editing: None,
+                column_to_remove: None,
+                column_to_match: None,
+                match_value: "".to_string(),
+                graph_pan: Vec2::ZERO,
+                graph_zoom: 1.0,
+                node_positions: Vec::new(),
+                layout_done: false,
             },
         }
     }
@@ -118,10 +128,45 @@ impl eframe::App for MyApp {
             ui.separator();
             match self.state.selected_tab {
                 Tab::Preview => ui::preview_tab(ctx, ui, &mut self.state),
-                Tab::Plot => ui::plot_tab(ui, &mut self.state),
-                Tab::QC => ui::qc_tab(ui, &mut self.state),
+                Tab::Graph => ui::graph_tab(ctx, ui, &mut self.state),
+                Tab::BarChart => ui::bar_chart_tab(ctx, ui, &mut self.state),
             }
         });
+
+        if let Some((path, note_idx)) = &mut self.state.note_editing {
+            if let Some(proj) = get_project_mut(&mut self.state.projects, path) {
+                if let Some(note) = proj.notes.get_mut(*note_idx) {
+                    let window_id = egui::Id::new((path.clone(), *note_idx));
+                    egui::Window::new(&note.name)
+                        .id(window_id)
+                        .resizable(true)
+                        .collapsible(false)
+                        .default_size([400.0, 300.0])
+                        .show(ctx, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Note Name:");
+                                ui.text_edit_singleline(&mut note.name);
+                            });
+
+                            ui.separator();
+
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut note.content)
+                                        .desired_rows(20)
+                                        .desired_width(f32::INFINITY)
+                                        .code_editor(),
+                                );
+                            });
+
+                            ui.separator();
+                            if ui.button("Close").clicked() {
+                                self.state.note_editing = None;
+                            }
+                        });
+                }
+            }
+        }
     }
 }
 

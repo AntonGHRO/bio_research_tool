@@ -1,16 +1,19 @@
-use crate::models::{AppState, Dataset, Project, Tab};
+use crate::models::{AppState, Dataset, Note, Project, Tab};
 use eframe::egui;
-use egui::{Align2, Color32};
-use egui::{Direction, Layout, Ui};
+use eframe::egui::{Align2, Color32, Pos2, Rect, Sense, Vec2};
+use eframe::emath::RectTransform;
+use egui::{Direction, Layout};
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{Bar, BarChart, Plot};
-use polars::datatypes::DataType;
+use polars::datatypes::BooleanChunked;
+use polars::error::PolarsResult;
+use polars::prelude::DataFrame;
+use polars::prelude::{ChunkCompare, DataType};
 use polars::prelude::{CsvReader, SerReader};
-use polars::prelude::{DataFrame, Series};
 use rfd::FileDialog;
-use std::collections::HashMap;
+use std::ops::Not;
 
-fn get_project_mut<'a>(projects: &'a mut [Project], path: &[usize]) -> Option<&'a mut Project> {
+pub fn get_project_mut<'a>(projects: &'a mut [Project], path: &[usize]) -> Option<&'a mut Project> {
     if path.is_empty() {
         return None;
     }
@@ -47,22 +50,31 @@ fn delete_project_at_path(projects: &mut Vec<Project>, path: &[usize]) {
 }
 
 fn draw_project_tree(
-    ui: &mut Ui,
+    ui: &mut egui::Ui,
     proj: &Project,
     path_so_far: &Vec<usize>,
     level: usize,
     state: &AppState,
-) -> Option<Vec<usize>> {
-    let mut clicked_path: Option<Vec<usize>> = None;
+) -> Option<(Vec<usize>, Option<usize>)> {
+    let mut clicked: Option<(Vec<usize>, Option<usize>)> = None;
 
     let is_selected = state.selected_project_path == *path_so_far;
 
     ui.horizontal(|ui| {
         ui.add_space(level as f32 * 16.0);
         if ui.selectable_label(is_selected, &proj.name).clicked() {
-            clicked_path = Some(path_so_far.clone());
+            clicked = Some((path_so_far.clone(), None));
         }
     });
+
+    for (note_idx, note) in proj.notes.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add_space((level + 1) as f32 * 16.0);
+            if ui.button(format!("📝 {}", note.name)).clicked() {
+                clicked = Some((path_so_far.clone(), Some(note_idx)));
+            }
+        });
+    }
 
     if !proj.datasets.is_empty() {
         for ds in &proj.datasets {
@@ -76,31 +88,36 @@ fn draw_project_tree(
     for (child_idx, child_proj) in proj.subprojects.iter().enumerate() {
         let mut child_path = path_so_far.clone();
         child_path.push(child_idx);
-        if clicked_path.is_none() {
+        if clicked.is_none() {
             if let Some(found) = draw_project_tree(ui, child_proj, &child_path, level + 1, state) {
-                clicked_path = Some(found);
+                clicked = Some(found);
             }
         }
     }
 
-    clicked_path
+    clicked
 }
 
 pub fn side_panel(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Projects");
 
-    let mut maybe_clicked: Option<Vec<usize>> = None;
+    let mut maybe_clicked: Option<(Vec<usize>, Option<usize>)> = None;
+
     for (i, proj) in state.projects.iter().enumerate() {
         let initial_path = vec![i];
         if maybe_clicked.is_none() {
-            if let Some(clicked) = draw_project_tree(ui, proj, &initial_path, 0, state) {
-                maybe_clicked = Some(clicked);
-            }
+            maybe_clicked = draw_project_tree(ui, proj, &initial_path, 0, state);
         }
     }
 
-    if let Some(new_path) = maybe_clicked {
-        state.selected_project_path = new_path;
+    if let Some((new_path, maybe_note_idx)) = maybe_clicked {
+        state.selected_project_path = new_path.clone();
+
+        if let Some(note_idx) = maybe_note_idx {
+            state.note_editing = Some((new_path, note_idx));
+        } else {
+            state.note_editing = None;
+        }
     }
 
     ui.separator();
@@ -114,7 +131,19 @@ pub fn side_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.text_edit_singleline(&mut sel_proj.name);
             }
         });
+
         ui.add_space(8.0);
+
+        if ui.button("＋ Add Note").clicked() {
+            if let Some(proj) = get_project_mut(&mut state.projects, &state.selected_project_path) {
+                proj.notes.push(Note {
+                    name: "New Note".into(),
+                    content: "".into(),
+                });
+                let note_idx = proj.notes.len() - 1;
+                state.note_editing = Some((state.selected_project_path.clone(), note_idx));
+            }
+        }
     }
 
     if ui.button("＋ Add Root Project").clicked() {
@@ -123,6 +152,7 @@ pub fn side_panel(ui: &mut egui::Ui, state: &mut AppState) {
             subprojects: Vec::new(),
             datasets: Vec::new(),
             selected_dataset: None,
+            notes: Vec::new(),
         });
         let idx = state.projects.len() - 1;
         state.selected_project_path = vec![idx];
@@ -138,6 +168,7 @@ pub fn side_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     subprojects: Vec::new(),
                     datasets: Vec::new(),
                     selected_dataset: None,
+                    notes: Vec::new(),
                 });
                 let child_idx = parent.subprojects.len() - 1;
                 let mut new_path = state.selected_project_path.clone();
@@ -160,7 +191,7 @@ pub fn side_panel(ui: &mut egui::Ui, state: &mut AppState) {
         egui::Window::new("Confirm Deletion")
             .collapsible(false)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(
@@ -184,7 +215,7 @@ pub fn side_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
 pub fn tab_bar(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
-        for &tab in &[Tab::Preview, Tab::Plot, Tab::QC] {
+        for &tab in &[Tab::Preview, Tab::Graph, Tab::BarChart] {
             let label = format!("{:?}", tab);
             if ui
                 .selectable_label(state.selected_tab == tab, label)
@@ -207,6 +238,9 @@ pub fn preview_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState)
                         .clicked()
                     {
                         proj.selected_dataset = Some(ds_idx);
+                        state.column_to_remove = None;
+                        state.column_to_match = None;
+                        state.match_value.clear();
                     }
                 }
 
@@ -218,10 +252,10 @@ pub fn preview_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState)
                             .unwrap_or("csv")
                             .to_string();
 
-                        let result: polars::prelude::PolarsResult<DataFrame> =
+                        let result: PolarsResult<DataFrame> =
                             CsvReader::from_path(&path).and_then(|r| {
                                 r.has_header(true)
-                                    .infer_schema(Some(10000))
+                                    .infer_schema(Some(10_000))
                                     .with_ignore_errors(true)
                                     .finish()
                             });
@@ -233,14 +267,121 @@ pub fn preview_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState)
                                 df: Some(df),
                             });
                             proj.selected_dataset = Some(proj.datasets.len() - 1);
+                            state.column_to_remove = None;
+                            state.column_to_match = None;
+                            state.match_value.clear();
                             ctx.request_repaint();
                         }
                     }
                 }
+
                 ui.label(format!("({} loaded)", proj.datasets.len()));
             });
 
             ui.separator();
+
+            if let Some(ds_idx) = proj.selected_dataset {
+                if let Some(ds) = proj.datasets.get_mut(ds_idx) {
+                    if let Some(df) = &ds.df {
+                        let col_names: Vec<String> = df
+                            .get_column_names()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect();
+
+                        ui.horizontal(|ui| {
+                            ui.label("Filter (remove one column):");
+
+                            let selected_col = state.column_to_remove.get_or_insert_with(|| {
+                                col_names.get(0).cloned().unwrap_or_default()
+                            });
+
+                            egui::ComboBox::from_id_source("remove_column_combo")
+                                .selected_text(selected_col.clone())
+                                .show_ui(ui, |ui| {
+                                    for name in &col_names {
+                                        ui.selectable_value(
+                                            selected_col,
+                                            name.clone(),
+                                            name.clone(),
+                                        );
+                                    }
+                                });
+
+                            if ui.button("Remove Column").clicked() {
+                                if !selected_col.is_empty() && col_names.contains(selected_col) {
+                                    if let Some(orig_df) = &mut ds.df {
+                                        if let Ok(mut new_df) = orig_df.drop(selected_col) {
+                                            *orig_df = new_df.clone();
+                                            state.column_to_remove = None;
+                                            ctx.request_repaint();
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        ui.separator();
+
+                        ui.horizontal(|ui| {
+                            ui.label("Remove rows where");
+
+                            let selected_match_col =
+                                state.column_to_match.get_or_insert_with(|| {
+                                    col_names.get(0).cloned().unwrap_or_default()
+                                });
+
+                            egui::ComboBox::from_id_source("remove_rows_combo")
+                                .selected_text(selected_match_col.clone())
+                                .show_ui(ui, |ui| {
+                                    for name in &col_names {
+                                        ui.selectable_value(
+                                            selected_match_col,
+                                            name.clone(),
+                                            name.clone(),
+                                        );
+                                    }
+                                });
+
+                            ui.label("= ");
+
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.match_value)
+                                    .id_source("match_value_input")
+                                    .hint_text("value to match"),
+                            );
+
+                            if ui.button("Remove Rows").clicked() {
+                                let input_str = state.match_value.trim().to_string();
+                                if !input_str.is_empty() && col_names.contains(selected_match_col) {
+                                    if let Some(orig_df) = &mut ds.df {
+                                        if let Ok(s) = orig_df
+                                            .column(selected_match_col)
+                                            .and_then(|series| series.cast(&DataType::Utf8))
+                                        {
+                                            if let Ok(utf8_chunked) = s.utf8() {
+                                                let equal_mask: BooleanChunked =
+                                                    utf8_chunked.equal(input_str.as_str());
+                                                let keep_mask = equal_mask.not();
+
+                                                if let Ok(filtered_df) = orig_df.filter(&keep_mask)
+                                                {
+                                                    *orig_df = filtered_df;
+                                                    state.column_to_match = None;
+                                                    state.match_value.clear();
+                                                    ctx.request_repaint();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        ui.separator();
+                    }
+                }
+            }
 
             ui.vertical(|ui| {
                 egui::ScrollArea::both().show(ui, |ui| {
@@ -281,12 +422,10 @@ pub fn preview_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState)
                                 ui.label("Dataset loaded but empty.");
                             }
                         }
+                    } else if proj.datasets.is_empty() {
+                        ui.label("No dataset loaded.");
                     } else {
-                        if proj.datasets.is_empty() {
-                            ui.label("No dataset loaded.");
-                        } else {
-                            ui.label("Select a dataset to preview.");
-                        }
+                        ui.label("Select a dataset to preview.");
                     }
                 });
             });
@@ -298,82 +437,290 @@ pub fn preview_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState)
     }
 }
 
-pub fn plot_tab(ui: &mut egui::Ui, state: &mut AppState) {
+pub fn graph_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) {
+    ui.vertical(|ui| {
+        ui.heading("Graph Viewer");
+
+        let available_size = ui.available_size();
+        let (rect, response) =
+            ui.allocate_exact_size(available_size, Sense::drag().union(Sense::hover()));
+
+        if response.dragged() {
+            state.graph_pan += response.drag_delta();
+        }
+
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                let zoom_factor = (scroll * 0.005).exp();
+                state.graph_zoom = (state.graph_zoom * zoom_factor).clamp(0.1, 10.0);
+            }
+        }
+
+        if !state.layout_done {
+            let mut positions = Vec::with_capacity(100);
+            let node_spacing = 400.0;
+            for i in 0..100 {
+                let col = (i % 10) as f32;
+                let row = (i / 10) as f32;
+                positions.push(Vec2::new(col * node_spacing, row * node_spacing));
+            }
+
+            let mut edges = Vec::new();
+            for i in 0..100 {
+                if i % 10 < 9 {
+                    edges.push((i, i + 1));
+                }
+                if i / 10 < 9 {
+                    edges.push((i, i + 10));
+                }
+            }
+
+            let n = positions.len() as f32; // = 100.0
+            let area = 2000.0 * 2000.0;
+            let k = (area / n).sqrt();
+            let iterations = 50;
+            let mut disp = vec![Vec2::ZERO; 100];
+
+            for _ in 0..iterations {
+                for d in disp.iter_mut() {
+                    *d = Vec2::ZERO;
+                }
+
+                for i in 0..100 {
+                    for j in (i + 1)..100 {
+                        let delta = positions[i] - positions[j];
+                        let dist = delta.length().max(1.0);
+                        let force = (k * k) / dist;
+                        let direction = delta / dist;
+                        disp[i] += direction * force;
+                        disp[j] -= direction * force;
+                    }
+                }
+
+                for &(u, v) in &edges {
+                    let delta = positions[u] - positions[v];
+                    let dist = delta.length().max(1.0);
+                    let force = (dist * dist) / k;
+                    let direction = delta / dist;
+                    disp[u] -= direction * force;
+                    disp[v] += direction * force;
+                }
+
+                let temperature = 50.0;
+                for i in 0..100 {
+                    let d = disp[i];
+                    let length = d.length().max(1.0);
+                    positions[i] += (d / length) * length.min(temperature);
+                }
+            }
+
+            state.node_positions = positions;
+            state.layout_done = true;
+        }
+
+        let top_left = (-state.graph_pan) / state.graph_zoom;
+        let world_size = rect.size() / state.graph_zoom;
+        let world_rect = Rect::from_min_size(Pos2::new(top_left.x, top_left.y), world_size);
+        let to_screen: RectTransform = RectTransform::from_to(world_rect, rect);
+        let painter = ui.painter_at(rect);
+
+        for i in 0..100 {
+            let wp = state.node_positions[i];
+            let sp = to_screen.transform_pos(Pos2::new(wp.x, wp.y));
+
+            if i % 10 < 9 {
+                let wp_r = state.node_positions[i + 1];
+                let sp_r = to_screen.transform_pos(Pos2::new(wp_r.x, wp_r.y));
+                painter.line_segment([sp, sp_r], (2.0, Color32::WHITE));
+            }
+            if i / 10 < 9 {
+                let wp_d = state.node_positions[i + 10];
+                let sp_d = to_screen.transform_pos(Pos2::new(wp_d.x, wp_d.y));
+                painter.line_segment([sp, sp_d], (2.0, Color32::WHITE));
+            }
+        }
+
+        let node_radius_world = 50.0;
+        for (i, &wp) in state.node_positions.iter().enumerate() {
+            let screen_pos = to_screen.transform_pos(Pos2::new(wp.x, wp.y));
+            let r_screen = node_radius_world * state.graph_zoom;
+
+            painter.circle_filled(screen_pos, r_screen, Color32::from_rgb(100, 150, 200));
+
+            let label = format!("Node {}", i + 1);
+            let text_style = egui::TextStyle::Body.resolve(ui.style());
+
+            let offsets = [
+                Vec2::new(-1.0, -1.0),
+                Vec2::new(-1.0, 1.0),
+                Vec2::new(1.0, -1.0),
+                Vec2::new(1.0, 1.0),
+            ];
+            for &off in &offsets {
+                let pos = screen_pos + off;
+                painter.text(
+                    pos,
+                    Align2::CENTER_CENTER,
+                    &label,
+                    text_style.clone(),
+                    Color32::WHITE,
+                );
+            }
+            painter.text(
+                screen_pos,
+                Align2::CENTER_CENTER,
+                &label,
+                text_style,
+                Color32::BLACK,
+            );
+        }
+    });
+}
+
+pub fn bar_chart_tab(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) {
     if let Some(proj) = get_project_mut(&mut state.projects, &state.selected_project_path) {
         ui.vertical(|ui| {
-            if let Some(ds_idx) = proj.selected_dataset {
-                if let Some(ds) = proj.datasets.get(ds_idx) {
-                    if let Some(df) = &ds.df {
-                        let mut grouped: DataFrame =
-                            df.groupby(&["GeneSymbol"]).unwrap().count().unwrap();
+            ui.heading("Diseases per Gene (Mock Data)");
 
-                        let first_count_col: String = grouped
-                            .get_column_names()
-                            .iter()
-                            .find(|name| name.ends_with("_count"))
-                            .expect("Expected at least one column ending in \"_count\"")
-                            .to_string();
+            if proj.datasets.is_empty() {
+                ui.label("No datasets loaded. Go to Preview → ＋ Add CSV to load one.");
+                return;
+            }
 
-                        grouped.rename(&first_count_col, "count").unwrap();
-
-                        let counts_series: Series = grouped
-                            .column("count")
-                            .unwrap()
-                            .cast(&DataType::Int64)
-                            .unwrap()
-                            .clone();
-
-                        let counts_chunked = counts_series.i64().unwrap();
-                        let count_vec: Vec<i64> = counts_chunked.into_no_null_iter().collect();
-
-                        let mut freq_map: HashMap<i64, i64> = HashMap::new();
-                        for &num_diseases in &count_vec {
-                            *freq_map.entry(num_diseases).or_insert(0) += 1;
+            let current_idx = proj.selected_dataset.unwrap_or(0);
+            let mut chosen_idx = current_idx;
+            ui.horizontal(|ui| {
+                ui.label("Dataset: ");
+                egui::ComboBox::from_id_source("mock_bar_dataset_combo")
+                    .selected_text(
+                        proj.datasets
+                            .get(chosen_idx)
+                            .map(|ds| ds.name.clone())
+                            .unwrap_or_else(|| "<none>".into()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (i, ds) in proj.datasets.iter().enumerate() {
+                            ui.selectable_value(&mut chosen_idx, i, ds.name.clone());
                         }
+                    });
+                if chosen_idx != current_idx {
+                    proj.selected_dataset = Some(chosen_idx);
+                }
+            });
 
-                        let mut bins: Vec<(f64, f64)> = freq_map
-                            .into_iter()
-                            .map(|(num_diseases, num_genes)| {
-                                (num_diseases as f64, num_genes as f64)
-                            })
-                            .collect();
-                        bins.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            ui.separator();
 
-                        let bars: Vec<Bar> = bins
-                            .into_iter()
-                            .map(|(x, _)| {
-                                let bar = Bar::new(x, 0.8);
-                                bar
-                            })
-                            .collect();
+            if let Some(ds_idx) = proj.selected_dataset {
+                if let Some(_ds) = proj.datasets.get(ds_idx) {
+                    // TODO:    Replace these two Vecs with a call into your Python backend:
+                    //          let (genes, counts) = python_backend::compute_disease_counts(&ds.path);
+                    let genes = vec![
+                        "TP53".to_string(),
+                        "BRCA1".to_string(),
+                        "EGFR".to_string(),
+                        "MYC".to_string(),
+                        "KRAS".to_string(),
+                    ];
+                    let counts = vec![42.0, 27.0, 13.0, 8.0, 5.0];
 
-                        Plot::new("diseases_per_gene_histogram")
-                            .view_aspect(2.0)
-                            .show(ui, |plot_ui| {
-                                plot_ui.bar_chart(
-                                    BarChart::new(bars).color(Color32::from_rgb(100, 150, 250)),
-                                );
-                            });
-                    } else {
-                        ui.label("Dataset loaded but empty.");
-                    }
+                    let bars: Vec<Bar> = counts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &c)| Bar::new(i as f64, c))
+                        .collect();
+
+                    Plot::new("mock_diseases_per_gene")
+                        .x_axis_formatter(|grid_mark, _range| {
+                            let idx = grid_mark.value.round() as usize;
+                            if idx < genes.len() {
+                                genes[idx].clone()
+                            } else {
+                                String::new()
+                            }
+                        })
+                        .show(ui, |plot_ui| {
+                            plot_ui.bar_chart(BarChart::new(bars));
+                        });
                 } else {
                     ui.label("Invalid dataset index.");
                 }
             } else {
-                ui.label("Select a dataset to plot.");
+                ui.label("Select a dataset from the dropdown above.");
             }
         });
     } else {
-        // No project selected at all
         ui.centered_and_justified(|ui| {
             ui.label("Select or create a project first.");
         });
     }
 }
 
-pub fn qc_tab(ui: &mut egui::Ui, _state: &mut AppState) {
-    ui.centered_and_justified(|ui| {
-        ui.label("🔍 QC tab not implemented yet");
-    });
-}
+// pub fn plot_tab(ui: &mut egui::Ui, state: &mut AppState) {
+//     if let Some(proj) = get_project_mut(&mut state.projects, &state.selected_project_path) {
+//         ui.vertical(|ui| {
+//             if let Some(ds_idx) = proj.selected_dataset {
+//                 if let Some(ds) = proj.datasets.get(ds_idx) {
+//                     if let Some(df) = &ds.df {
+//                         let mut grouped: DataFrame =
+//                             df.groupby(["GeneSymbol"]).unwrap().count().unwrap();
+
+//                         let first_count_col: String = grouped
+//                             .get_column_names()
+//                             .iter()
+//                             .find(|name| name.ends_with("_count"))
+//                             .expect("Expected at least one column ending in \"_count\"")
+//                             .to_string();
+
+//                         grouped.rename(&first_count_col, "count").unwrap();
+
+//                         let counts_series: Series = grouped
+//                             .column("count")
+//                             .unwrap()
+//                             .cast(&DataType::Int64)
+//                             .unwrap()
+//                             .clone();
+
+//                         let counts_chunked = counts_series.i64().unwrap();
+//                         let count_vec: Vec<i64> = counts_chunked.into_no_null_iter().collect();
+
+//                         let mut freq_map: HashMap<i64, i64> = HashMap::new();
+//                         for &num_diseases in &count_vec {
+//                             *freq_map.entry(num_diseases).or_insert(0) += 1;
+//                         }
+
+//                         let mut bins: Vec<(f64, f64)> = freq_map
+//                             .into_iter()
+//                             .map(|(num_diseases, num_genes)| {
+//                                 (num_diseases as f64, num_genes as f64)
+//                             })
+//                             .collect();
+//                         bins.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+//                         let bars: Vec<Bar> =
+//                             bins.into_iter().map(|(x, _)| Bar::new(x, 0.8)).collect();
+
+//                         Plot::new("diseases_per_gene_histogram")
+//                             .view_aspect(2.0)
+//                             .show(ui, |plot_ui| {
+//                                 plot_ui.bar_chart(
+//                                     BarChart::new(bars).color(Color32::from_rgb(100, 150, 250)),
+//                                 );
+//                             });
+//                     } else {
+//                         ui.label("Dataset loaded but empty.");
+//                     }
+//                 } else {
+//                     ui.label("Invalid dataset index.");
+//                 }
+//             } else {
+//                 ui.label("Select a dataset to plot.");
+//             }
+//         });
+//     } else {
+//         // No project selected at all
+//         ui.centered_and_justified(|ui| {
+//             ui.label("Select or create a project first.");
+//         });
+//     }
+// }
