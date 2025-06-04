@@ -584,14 +584,15 @@ pub fn graph_tab(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
 pub fn bar_chart_tab(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
     if let Some(proj) = get_project_mut(&mut state.projects, &state.selected_project_path) {
         ui.vertical(|ui| {
-            ui.heading("[selected field] ");
-            ui.heading("[selected field] entries ");
+            ui.heading(&state.bar_selected_field);
+            ui.heading(format!("{} entries", &state.bar_selected_value));
 
             if proj.datasets.is_empty() {
                 ui.label("No datasets loaded. Go to Preview → ＋ Add CSV to load one.");
                 return;
             }
 
+            // Dataset selector
             let current_idx = proj.selected_dataset.unwrap_or(0);
             let mut chosen_idx = current_idx;
             ui.horizontal(|ui| {
@@ -619,11 +620,9 @@ pub fn bar_chart_tab(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
 
             if let Some(ds_idx) = proj.selected_dataset {
                 if let Some(ds) = proj.datasets.get(ds_idx) {
+                    // 1) Load CSV into Polars DataFrame
                     let mut df = match CsvReader::from_path(&ds.path)
-                        .and_then(|rdr| rdr
-                            .infer_schema(None)
-                            .has_header(true)
-                            .finish())
+                        .and_then(|rdr| rdr.infer_schema(None).has_header(true).finish())
                     {
                         Ok(df) => df,
                         Err(err) => {
@@ -632,37 +631,41 @@ pub fn bar_chart_tab(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
                         }
                     };
 
+                    // 2) If we haven't fetched yet, call the backend
                     if state.bar_genes.is_empty() && !state.is_fetching {
                         state.is_fetching = true;
                         let key = state.bar_selected_field.clone();
                         let value = state.bar_selected_value.clone();
                         let mut df_for_request = df.clone();
 
-                        let response_result: Result<String, reqwest::Error> = request_bar_chart_blocking(&mut df_for_request, key, value);
+                        let response_result: Result<String, reqwest::Error> =
+                            request_bar_chart_blocking(&mut df_for_request, key, value);
 
                         state.is_fetching = false;
 
                         match response_result {
                             Ok(text) => {
-                                match serde_json::from_str::<Value>(&text) {
+                                // Parse JSON expecting {"bar_data": { key: count, ... }, ...}
+                                match serde_json::from_str::<serde_json::Value>(&text) {
                                     Ok(json) => {
-                                        if let (Some(genes_arr), Some(counts_arr)) = (
-                                            json.get("genes").and_then(|v| v.as_array()),
-                                            json.get("counts").and_then(|v| v.as_array()),
-                                        ) {
-                                            state.bar_genes = genes_arr
-                                                .iter()
-                                                .map(|v| v.as_str().unwrap_or("").to_string())
-                                                .collect();
-
-                                            state.bar_counts = counts_arr
-                                                .iter()
-                                                .map(|v| v.as_f64().unwrap_or(0.0))
-                                                .collect();
+                                        if let Some(bar_obj) = json.get("bar_data").and_then(|v| v.as_object()) {
+                                            state.bar_genes.clear();
+                                            state.bar_counts.clear();
+                                            for (k, v) in bar_obj.iter() {
+                                                state.bar_genes.push(k.clone());
+                                                // assuming counts are integers; convert to f64
+                                                if let Some(n) = v.as_i64() {
+                                                    state.bar_counts.push(n as f64);
+                                                } else if let Some(f) = v.as_f64() {
+                                                    state.bar_counts.push(f);
+                                                } else {
+                                                    state.bar_counts.push(0.0);
+                                                }
+                                            }
                                         } else {
                                             ui.colored_label(
                                                 egui::Color32::RED,
-                                                "Unexpected JSON format: missing 'genes' or 'counts'",
+                                                "Unexpected JSON format: missing 'bar_data' object",
                                             );
                                             return;
                                         }
@@ -686,6 +689,7 @@ pub fn bar_chart_tab(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
                         }
                     }
 
+                    // 3) If we now have bar_genes/bar_counts, plot them
                     if !state.bar_genes.is_empty() && state.bar_genes.len() == state.bar_counts.len()
                     {
                         let genes = &state.bar_genes;
@@ -697,7 +701,7 @@ pub fn bar_chart_tab(ctx: &egui::Context, ui: &mut Ui, state: &mut AppState) {
                             .map(|(i, &c)| Bar::new(i as f64, c))
                             .collect();
 
-                        Plot::new("real_diseases_per_gene")
+                        Plot::new("bar_chart")
                             .x_axis_formatter(|grid_mark, _range| {
                                 let idx = grid_mark.value.round() as usize;
                                 if idx < genes.len() {
