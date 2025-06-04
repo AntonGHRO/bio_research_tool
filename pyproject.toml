@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "bio-research-tool"
+version = "0.1.0"
+description = ""
+authors = ["dianaboglut <116947947+dianaboglut@users.noreply.github.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+pydantic = "^2.11.4"
+fastapi = "^0.115.12"
+uvicorn = "^0.34.2"
+notebook = "^7.4.1"
+pandas = "^2.2.3"
+networkx = "^3.4.2"
+matplotlib = "^3.10.1"
+scipy = "^1.15.2"
+scikit-learn = "^1.6.1"
+torch = "^2.7.0"
+torch-geometric = "^2.6.1"
+torchinfo = "^1.8.0"
+polars = "^1.30.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
